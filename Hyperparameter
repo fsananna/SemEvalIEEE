@@ -1,0 +1,118 @@
+import sys
+import importlib
+import gc
+
+# 1. Setup paths
+sys.path.append('/content/drive/MyDrive/AllData')
+
+# 2. Standard imports
+from config import *
+from utils import listnet_loss, evaluate_loader
+import torch
+import pandas as pd
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader
+
+# 3. Dynamic imports for numbered files (Bypasses Python's syntax limits)
+dataset_module = importlib.import_module('01_dataset_loader')
+IdiomDataset = dataset_module.IdiomDataset
+
+model_module = importlib.import_module('02_model_architecture')
+IdiomFusionModel = model_module.IdiomFusionModel
+
+# ==========================================
+# HYPERPARAMETER SEARCH (Cross-Validation)
+# ==========================================
+print("Starting Hyperparameter Search...")
+
+train_df = pd.read_csv(TRAIN_TSV, sep='\t')
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+results = []
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Number of epochs used ONLY for the CV search (kept short to keep search fast).
+# Must exceed BERT_UNFREEZE_EP so the unfreeze schedule is actually exercised
+# during CV, matching how the final model (04) will really train.
+CV_EPOCHS = 15
+
+# Grid of hyperparameters to test — sourced from config.py (single source of truth)
+grid = [(lr, bs) for lr in LR_BASE_OPTIONS for bs in BATCH_SIZE_OPTIONS]
+
+for lr_base, batch_size in grid:
+    print(f"\nTesting LR: {lr_base} | Batch Size: {batch_size}")
+    fold_metrics = []
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(train_df)):
+        train_sub = train_df.iloc[train_idx]
+        val_sub = train_df.iloc[val_idx]
+
+        train_loader = DataLoader(IdiomDataset(train_sub, TRAIN_ROOT, augment=True), batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(IdiomDataset(val_sub, TRAIN_ROOT, augment=False), batch_size=batch_size, shuffle=False)
+
+        model = IdiomFusionModel().to(device)
+
+        # Differential LR Optimizer per architectural rules
+        optimizer = torch.optim.AdamW([
+            {'params': model.sent_proj.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+            {'params': model.cap_proj.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+            {'params': model.vis_proj.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+            {'params': model.fusion_proj.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+            {'params': model.cross_attn.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+            {'params': model.ranking_head.parameters(), 'lr': lr_base, 'weight_decay': WEIGHT_DECAY},
+        ])
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CV_EPOCHS)
+
+        # Mini-training loop for CV
+        for ep in range(1, CV_EPOCHS + 1):
+
+            # BERT unfreeze schedule — hard rule, must fire during CV too,
+            # otherwise CV isn't testing the same dynamics as final training.
+            if ep == BERT_UNFREEZE_EP:
+                model.unfreeze_bert_last_n(BERT_UNFREEZE_LAYERS)
+                optimizer.add_param_group({
+                    'params': model.trainable_bert_params(),
+                    'lr': LR_BERT,
+                    'weight_decay': WEIGHT_DECAY
+                })
+
+            model.train()
+            for batch in train_loader:
+                s_ids, s_msk, imgs, c_ids, c_msk, scores = [b.to(device) for b in batch]
+                optimizer.zero_grad()
+
+                preds = model(s_ids, s_msk, imgs, c_ids, c_msk)
+                loss = listnet_loss(preds, scores, alpha=LABEL_SMOOTH_ALPHA)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            scheduler.step()
+
+        ndcg, top1 = evaluate_loader(model, val_loader, device)
+        fold_metrics.append((ndcg, top1))
+
+        # Free GPU memory before the next fold/config — prevents OOM over
+        # 6 configs x 5 folds = 30 sequential models on a Colab GPU.
+        del model, optimizer, scheduler
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    avg_ndcg = sum([m[0] for m in fold_metrics]) / 5
+    avg_top1 = sum([m[1] for m in fold_metrics]) / 5
+
+    print(f"Result -> Avg NDCG: {avg_ndcg:.4f} | Avg Top-1: {avg_top1:.4f}")
+    results.append({'LR_BASE': lr_base, 'BATCH_SIZE': batch_size, 'Avg_NDCG': avg_ndcg, 'Avg_Top1': avg_top1})
+
+# Save results
+pd.DataFrame(results).to_csv('/content/drive/MyDrive/AllData/cv_results.csv', index=False)
+print("\n✅ Search complete! Results saved to cv_results.csv") 
+Output:LR_BASE,BATCH_SIZE,Avg_NDCG,Avg_Top1
+0.0001,4,0.8603600387412979,0.22857142857142856
+0.0001,8,0.8627368740379584,0.21428571428571427
+0.001,4,0.8624002922235185,0.2571428571428571
+0.001,8,0.8701189626951724,0.27142857142857146
+0.01,4,0.8738876527017011,0.2857142857142857
+0.01,8,0.854505898672044,0.21428571428571427
